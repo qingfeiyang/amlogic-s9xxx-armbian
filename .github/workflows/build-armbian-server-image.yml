@@ -9,95 +9,130 @@ jobs:
     env:
       BOARD: "s905l3"
       RELEASE: "bullseye"
-      # 尝试更稳定的内核版本（6.1.55是S905L3常用兼容版本）
-      KERNEL_VERSION: "6.1.55"
-      DTB_PATH: "https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/gxlx2_p295_1g.dtb"
-      OUTPUT_DIR: "build/output/images"
+      KERNEL_VERSION: "6.1.147"
+      DTB_URL: "https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/meson-gxlx2-p295.dtb"
+      DTB_FILE: "meson-gxlx2-p295.dtb"
+      OUTPUT_DIR: "${{ github.workspace }}/build/output/images"
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: 扩展磁盘空间（解决资源不足）
-      run: |
-        # GitHub Actions默认磁盘可能不足，扩展临时空间
-        df -h
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android  # 清理无用大文件
-        df -h
-
-    - name: 安装完整依赖（避免缺失）
+    - name: Setup build environment
       run: |
         sudo apt update -y
-        # 增加Armbian官方推荐的完整依赖列表
         sudo apt install -y \
           build-essential git libncurses5-dev libssl-dev \
           bc flex bison libelf-dev liblz4-tool whiptail \
           parted kmod debootstrap qemu-user-static \
           chroot dosfstools rsync u-boot-tools curl \
-          libfdt-dev libpython3-dev python3-distutils \
-          device-tree-compiler  # 新增设备树编译工具
+          wget xz-utils cpio \
+          python3-dev python3-pip python3-setuptools \
+          libpython3-dev libffi-dev libssl-dev \
+          binfmt-support qemu-user-static \
+          systemd-container u-boot-tools \
+          device-tree-compiler
 
-    - name: 验证并下载DTB（确保文件有效）
+    - name: Download and prepare DTB
       run: |
         mkdir -p userpatches/dtb
-        # 增加超时和重试机制
-        wget --tries=3 --timeout=10 -O "userpatches/dtb/gxlx2_p295_1g.dtb" ${{ env.DTB_PATH }}
-        # 验证DTB文件完整性（检查文件大小）
-        if [ ! -f "userpatches/dtb/gxlx2_p295_1g.dtb" ] || [ $(stat -c%s "userpatches/dtb/gxlx2_p295_1g.dtb") -lt 1024 ]; then
-          echo "错误：DTB文件下载失败或不完整"
+        wget -O "userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}"
+        
+        # 验证DTB文件
+        if [ ! -f "userpatches/dtb/${{ env.DTB_FILE }}" ]; then
+          echo "❌ DTB文件下载失败"
           exit 1
         fi
-        # 显示DTB文件信息（确认格式正确）
-        fdtdump userpatches/dtb/gxlx2_p295_1g.dtb | head -5
+        
+        # 检查DTB是否有效
+        if ! dtc -I dtb -O dts "userpatches/dtb/${{ env.DTB_FILE }}" > /dev/null 2>&1; then
+          echo "❌ 下载的DTB文件无效"
+          exit 1
+        fi
+        echo "✅ DTB文件验证通过"
 
-    - name: 克隆Armbian仓库并验证内核版本
+    - name: Clone Armbian build repository
       run: |
         git clone --depth=1 https://github.com/armbian/build.git
         cd build
-        # 更严格的内核版本验证（检查是否存在对应分支）
-        KERNEL_TAG="v${{ env.KERNEL_VERSION }}"
-        if ! git ls-remote --tags https://github.com/armbian/linux | grep -q "${KERNEL_TAG}$"; then
-          echo "错误：内核版本 ${KERNEL_TAG} 不存在，请更换版本"
+        
+        # 验证内核版本是否存在
+        if ! git ls-remote --tags https://github.com/armbian/linux-armbian | grep "v${{ env.KERNEL_VERSION }}"; then
+          echo "❌ 错误：内核版本 ${{ env.KERNEL_VERSION }} 不存在"
           exit 1
         fi
-        echo "内核版本 ${KERNEL_TAG} 验证通过"
+        echo "✅ 内核版本验证通过"
 
-    - name: 编译Armbian（增加调试日志）
+    - name: Fix permissions
+      run: |
+        sudo chown -R $USER:$USER ${{ github.workspace }}
+        sudo chmod -R a+rw ${{ github.workspace }}
+
+    - name: Build Armbian image
       run: |
         cd build
-        # 增加--debug参数输出详细日志，同时保存到文件
+        
+        # 设置编译环境变量
+        export DEBIAN_FRONTEND=noninteractive
+        export LANG=C.UTF-8
+        
+        # 启用详细日志
+        export SHOW_LOG=yes
+        export DEBUG_MODE=yes
+        
+        # 开始构建
         sudo ./compile.sh \
-          BOARD=${{ env.BOARD }} \
+          BOARD="${{ env.BOARD }}" \
           BRANCH=current \
-          RELEASE=${{ env.RELEASE }} \
+          RELEASE="${{ env.RELEASE }}" \
           KERNEL_ONLY=no \
           KERNEL_CONFIGURE=no \
           BUILD_DESKTOP=no \
-          CLEAN_LEVEL="images" \
+          CLEAN_LEVEL="none" \
           USE_TORRENT=no \
-          CUSTOM_DTB="../userpatches/dtb/gxlx2_p295_1g.dtb" \
+          CUSTOM_DTB="../userpatches/dtb/${{ env.DTB_FILE }}" \
           KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
           EXTRA_ARGUMENTS="USB_INIT=yes" \
-          --debug 2>&1 | tee build.log  # 保存日志到build.log
-
-    - name: 上传编译日志（便于排查失败原因）
-      if: always()  # 即使失败也上传日志
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-logs
-        path: build/build.log
-
-    - name: 验证并上传镜像
-      run: |
-        if [ -z "$(ls -A ${{ env.OUTPUT_DIR }}/*.img.xz 2>/dev/null)" ]; then
-          echo "错误：未生成镜像文件"
+          LOG_OUTPUT_FILE="${{ github.workspace }}/build.log"
+        
+        # 检查构建状态
+        if [ $? -ne 0 ]; then
+          echo "❌ 镜像构建失败"
+          echo "=== 最后50行日志 ==="
+          tail -n 50 "${{ github.workspace }}/build.log"
           exit 1
         fi
-        ls -lh ${{ env.OUTPUT_DIR }}/*.img.xz
 
-    - name: 上传镜像
+    - name: Verify build output
+      run: |
+        OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+        
+        if [ ! -d "$OUTPUT_DIR" ]; then
+          echo "❌ 错误：输出目录不存在: $OUTPUT_DIR"
+          exit 1
+        fi
+        
+        if [ -z "$(ls -A $OUTPUT_DIR/*.img 2>/dev/null)" ]; then
+          echo "❌ 错误：未找到镜像文件"
+          echo "=== 构建日志 ==="
+          cat "${{ github.workspace }}/build.log"
+          exit 1
+        fi
+        
+        echo "✅ 构建成功！生成的镜像:"
+        ls -lh $OUTPUT_DIR/*.img
+
+    - name: Upload artifact
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: Armbian_S905L3B_Image
-        path: ${{ env.OUTPUT_DIR }}/*.img.xz
+        path: ${{ env.OUTPUT_DIR }}/*.img
         retention-days: 30
+
+    - name: Upload build log
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Build_Log
+        path: ${{ github.workspace }}/build.log
