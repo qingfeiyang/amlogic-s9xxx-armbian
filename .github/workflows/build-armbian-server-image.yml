@@ -1,4 +1,4 @@
-name: Build Armbian for S905L3B (Force Logs)
+name: Build Armbian for S905L3B (Fix Exit 43)
 
 on:
   workflow_dispatch:
@@ -14,54 +14,60 @@ jobs:
       run: |
         git clone --depth=1 https://github.com/armbian/build.git
 
-    - name: 安装依赖（强制日志输出，极简步骤）
+    - name: 安装依赖（极简稳定版）
       run: |
-        # 关键：开启命令跟踪（每步命令都打印），并强制输出到 GitHub 日志流
         set -x
-        # 确保日志能被 GitHub 捕获（即使中间失败）
-        echo "=== 系统状态检查 ==="
-        df -h  # 检查磁盘空间（exit code 1 常见原因：磁盘满）
-        free -m  # 检查内存
-        id  # 检查当前用户权限
-
-        echo "=== 清理系统缓存 ==="
         sudo apt clean
-        sudo rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* || true  # 允许失败
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android  # 释放20GB+空间
+        df -h
+        sudo apt update -y
+        sudo apt install -y build-essential git debootstrap qemu-user-static \
+          bc flex bison libssl-dev u-boot-tools rsync
+        set +x
 
-        echo "=== 更换为清华 apt 源（确保网络稳定） ==="
-        sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-        echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy main restricted universe multiverse
-        deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-updates main restricted universe multiverse
-        deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-backports main restricted universe multiverse
-        deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-security main restricted universe multiverse" | sudo tee /etc/apt/sources.list
-
-        echo "=== 更新源（单独步骤，失败立即报错） ==="
-        sudo apt update -y || { echo "❌ apt update 失败"; exit 1; }
-
-        echo "=== 安装核心依赖（分最小集，逐个检查） ==="
-        # 只安装必须依赖，减少失败点
-        sudo apt install -y build-essential || { echo "❌ 缺少基础编译工具"; exit 1; }
-        sudo apt install -y git wget || { echo "❌ 缺少 git/wget"; exit 1; }
-        sudo apt install -y debootstrap qemu-user-static || { echo "❌ 缺少系统构建工具"; exit 1; }
-        sudo apt install -y linux-headers-generic || { echo "❌ 缺少内核头文件（非致命，继续）"; }
-
-        echo "=== 依赖安装成功 ==="
-        set +x  # 关闭命令跟踪
-
-    - name: 编译 Armbian 镜像
+    - name: 编译 Armbian（强制日志+资源监控）
       run: |
+        # 关键：创建编译日志文件，监控内存/磁盘并写入日志
+        COMPILE_LOG="/tmp/armbian-compile.log"
+        touch $COMPILE_LOG
+        # 后台实时监控资源使用（每30秒记录一次）
+        (while true; do
+          echo "=== 资源监控 $(date) ===" >> $COMPILE_LOG
+          free -m >> $COMPILE_LOG
+          df -h >> $COMPILE_LOG
+          sleep 30
+        done) &
+        MONITOR_PID=$!  # 记录监控进程ID
+
+        # 执行编译，强制输出所有日志到文件
+        echo "=== 开始编译 $(date) ===" >> $COMPILE_LOG
         cd build
         sudo ./compile.sh \
           BOARD=s905l3 \
-          BRANCH=current \
+          BRANCH=legacy \  # 切换到更稳定的旧分支（减少兼容性问题）
           RELEASE=bullseye \
           KERNEL_ONLY=no \
           BUILD_DESKTOP=no \
           CLEAN_LEVEL=images \
           USE_TORRENT=no \
-          EXTRA_ARGUMENTS="USB_INIT=yes"
+          KERNELBRANCH="tag:v5.15.137" \  # 5.15内核对S905L3更稳定
+          EXTRA_ARGUMENTS="USB_INIT=yes" \
+          --debug 2>&1 >> $COMPILE_LOG  # 开启debug模式，捕获详细日志
 
-    - name: 上传镜像
+        # 编译结束后终止监控进程
+        kill $MONITOR_PID
+        echo "=== 编译结束 $(date) ===" >> $COMPILE_LOG
+
+    - name: 上传编译日志（无论成败）
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: compile-logs
+        path: /tmp/armbian-compile.log
+        retention-days: 7
+
+    - name: 上传镜像（成功时）
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: armbian-s905l3b-usb
