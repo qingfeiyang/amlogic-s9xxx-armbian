@@ -314,42 +314,15 @@ jobs:
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Compile Armbian [ ${{ inputs.set_release }} ]
-        id: compile
+	    id: compile
         working-directory: /builder
         if: ${{ steps.down.outputs.status }} == 'success' && !cancelled()
         run: |
-          cd build/
-          
-          # 为 S905L3B 创建专用设备树目录
-          mkdir -p userpatches/dtb
-          wget -O userpatches/dtb/meson-gxlx2-p295.dtb \
-            https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/meson-gxlx2-p295.dtb
-          
-          # 验证设备树文件
-          if ! file userpatches/dtb/meson-gxlx2-p295.dtb | grep -q "Device Tree Blob"; then
-            echo "❌ DTB 文件验证失败"
-            exit 1
-          fi
-          
-          # 编译命令（针对 S905L3B 优化）
-          ./compile.sh \
-            RELEASE=${{ inputs.set_release }} \
-            BOARD=s905l3b \  # 修改为正确的板型
-            BRANCH=current \
-            BUILD_MINIMAL=no \
-            BUILD_ONLY=default \
-            HOST=armbian \
-            BUILD_DESKTOP=no \
-            EXPERT=yes \
-            KERNEL_CONFIGURE=no \
-            COMPRESS_OUTPUTIMAGE="sha" \
-            SHARE_LOG=yes \
-            CUSTOM_DTB="meson-gxlx2-p295.dtb" \  # 添加自定义设备树
-            KERNELBRANCH="tag:v6.1.147" \  # 指定内核版本
-            CLEAN_LEVEL="none" \  # 避免清理缓存
-            USE_TORRENT="no"  # 禁用种子下载
-          
-          echo "status=success" >> ${GITHUB_OUTPUT}
+		  cd build/
+		  ./compile.sh RELEASE=${{ inputs.set_release }} BOARD=${{ inputs.armbian_board }} BRANCH=current BUILD_MINIMAL=no \
+					   BUILD_ONLY=default HOST=armbian BUILD_DESKTOP=no EXPERT=yes KERNEL_CONFIGURE=no \
+					   COMPRESS_OUTPUTIMAGE="sha" SHARE_LOG=yes
+		  echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Organize files and clear space
         id: clean
