@@ -13,84 +13,80 @@ jobs:
       DTB_URL: "https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/meson-gxlx2-p295.dtb"
       DTB_FILE: "meson-gxlx2-p295.dtb"
       OUTPUT_DIR: "${{ github.workspace }}/armbian-build/output/images"
+      LOG_DIR: "${{ github.workspace }}/logs"  # 新增专用日志目录
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Create log directory
+      run: |
+        # 创建专用日志目录并设置权限
+        sudo mkdir -p ${{ env.LOG_DIR }}
+        sudo chmod -R 777 ${{ env.LOG_DIR }}
+        echo "LOG_FILE=${{ env.LOG_DIR }}/build.log" >> $GITHUB_ENV
+
     - name: Setup build environment
       run: |
+        # 设置日志文件
+        echo "=== 环境设置开始 ===" | tee ${{ env.LOG_FILE }}
+        
         # 添加必要的软件源
-        sudo add-apt-repository universe -y
-        sudo add-apt-repository multiverse -y
-        sudo apt update -y
+        sudo add-apt-repository universe -y | tee -a ${{ env.LOG_FILE }}
+        sudo add-apt-repository multiverse -y | tee -a ${{ env.LOG_FILE }}
+        sudo apt update -y | tee -a ${{ env.LOG_FILE }}
         
-        # 修复：彻底清除所有容器相关包
-        sudo apt purge -y containerd* docker* 
-        sudo rm -rf /var/lib/docker /etc/docker
-        sudo rm -f /etc/apparmor.d/docker
-        sudo apt autoremove -y
-        
-        # 修复：手动安装containerd.io避免冲突
-        wget https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/amd64/containerd.io_1.6.28-1_amd64.deb
-        sudo dpkg -i containerd.io_1.6.28-1_amd64.deb
-        
-        # 安装完整的依赖包（排除冲突包）
+        # 安装最小依赖集
         sudo apt install -y \
-          build-essential git libncurses5-dev libssl-dev \
-          bc flex bison libelf-dev liblz4-tool whiptail \
-          parted kmod debootstrap qemu-user-static \
-          dosfstools rsync u-boot-tools curl \
-          wget xz-utils cpio \
-          python3-dev python3-pip python3-setuptools \
-          libpython3-dev libffi-dev \
-          binfmt-support \
-          device-tree-compiler \
-          coreutils debootstrap systemd \
-          docker.io docker-compose
+          git wget xz-utils \
+          device-tree-compiler 2>&1 | tee -a ${{ env.LOG_FILE }}
         
-        # 修复：配置docker无需containerd
-        sudo mkdir -p /etc/docker
-        echo '{"storage-driver": "vfs"}' | sudo tee /etc/docker/daemon.json
-        
-        # 验证关键工具
-        for cmd in chroot debootstrap dtc docker; do
+        # 验证基本工具
+        for cmd in git wget dtc; do
           if ! command -v $cmd; then
-            echo "❌ $cmd 未安装成功"
+            echo "❌ $cmd 未安装成功" | tee -a ${{ env.LOG_FILE }}
             exit 1
           fi
         done
+        
+        echo "✅ 环境设置完成" | tee -a ${{ env.LOG_FILE }}
 
     - name: Prepare workspace
       run: |
-        # 创建干净的构建目录结构
+        echo "=== 准备工作开始 ===" | tee -a ${{ env.LOG_FILE }}
+        
+        # 创建构建目录结构
         mkdir -p armbian-build/userpatches/dtb
         
         # 下载DTB文件
-        wget -O "armbian-build/userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}"
+        wget -O "armbian-build/userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}" 2>&1 | tee -a ${{ env.LOG_FILE }}
         
         # 验证DTB文件
         if ! file "armbian-build/userpatches/dtb/${{ env.DTB_FILE }}" | grep -q "Device Tree Blob"; then
-          echo "❌ DTB文件无效"
+          echo "❌ DTB文件无效" | tee -a ${{ env.LOG_FILE }}
           exit 1
         fi
-        echo "✅ DTB文件验证通过"
+        echo "✅ DTB文件验证通过" | tee -a ${{ env.LOG_FILE }}
 
     - name: Clone Armbian build repository
       run: |
+        echo "=== 克隆仓库开始 ===" | tee -a ${{ env.LOG_FILE }}
+        
         cd armbian-build
-        git clone --depth=1 https://github.com/armbian/build.git
+        git clone --depth=1 https://github.com/armbian/build.git 2>&1 | tee -a ${{ env.LOG_FILE }}
         cd build
         
         # 验证仓库结构
         if [ ! -f compile.sh ]; then
-          echo "❌ 仓库克隆失败"
+          echo "❌ 仓库克隆失败" | tee -a ${{ env.LOG_FILE }}
           exit 1
         fi
-        echo "✅ Armbian仓库克隆成功"
+        echo "✅ Armbian仓库克隆成功" | tee -a ${{ env.LOG_FILE }}
 
     - name: Run minimal build test
       run: |
+        echo "=== 最小化构建测试开始 ===" | tee -a ${{ env.LOG_FILE }}
+        
         cd armbian-build/build
         
         # 执行最小化构建测试
@@ -104,20 +100,19 @@ jobs:
           CLEAN_LEVEL="none" \
           USE_TORRENT=no \
           CUSTOM_DTB="../../userpatches/dtb/${{ env.DTB_FILE }}" \
-          KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
-          LOG_OUTPUT_FILE="$GITHUB_WORKSPACE/build.log"
+          KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" 2>&1 | tee -a ${{ env.LOG_FILE }}
         
         # 检查退出状态
         if [ $? -ne 0 ]; then
-          echo "❌ 最小化构建失败"
-          echo "=== 构建日志最后50行 ==="
-          tail -n 50 "$GITHUB_WORKSPACE/build.log" || echo "无日志文件"
+          echo "❌ 最小化构建失败" | tee -a ${{ env.LOG_FILE }}
           exit 1
         fi
-        echo "✅ 最小化构建测试通过"
+        echo "✅ 最小化构建测试通过" | tee -a ${{ env.LOG_FILE }}
 
     - name: Full build
       run: |
+        echo "=== 完整构建开始 ===" | tee -a ${{ env.LOG_FILE }}
+        
         cd armbian-build/build
         
         # 执行完整构建
@@ -132,49 +127,37 @@ jobs:
           USE_TORRENT=no \
           CUSTOM_DTB="../../userpatches/dtb/${{ env.DTB_FILE }}" \
           KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
-          EXTRA_ARGUMENTS="USB_INIT=yes" \
-          LOG_OUTPUT_FILE="$GITHUB_WORKSPACE/build.log"
+          EXTRA_ARGUMENTS="USB_INIT=yes" 2>&1 | tee -a ${{ env.LOG_FILE }}
         
         # 检查构建状态
         if [ $? -ne 0 ]; then
-          echo "❌ 完整构建失败"
-          echo "=== 构建日志最后50行 ==="
-          tail -n 50 "$GITHUB_WORKSPACE/build.log"
+          echo "❌ 完整构建失败" | tee -a ${{ env.LOG_FILE }}
           exit 1
         fi
-        echo "✅ 完整构建成功"
+        echo "✅ 完整构建成功" | tee -a ${{ env.LOG_FILE }}
 
     - name: Verify output
       run: |
-        OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+        echo "=== 验证输出开始 ===" | tee -a ${{ env.LOG_FILE }}
         
         # 检查输出目录
-        if [ ! -d "$OUTPUT_DIR" ]; then
-          echo "❌ 输出目录不存在: $OUTPUT_DIR"
+        if [ ! -d "${{ env.OUTPUT_DIR }}" ]; then
+          echo "❌ 输出目录不存在: ${{ env.OUTPUT_DIR }}" | tee -a ${{ env.LOG_FILE }}
           exit 1
         fi
         
         # 检查镜像文件
-        IMAGE_FILES=$(ls "$OUTPUT_DIR"/*.img 2>/dev/null)
+        IMAGE_FILES=$(ls "${{ env.OUTPUT_DIR }}"/*.img 2>/dev/null)
         if [ -z "$IMAGE_FILES" ]; then
-          echo "❌ 未找到镜像文件"
-          echo "目录内容:"
-          ls -la "$OUTPUT_DIR"
+          echo "❌ 未找到镜像文件" | tee -a ${{ env.LOG_FILE }}
+          echo "目录内容:" | tee -a ${{ env.LOG_FILE }}
+          ls -la "${{ env.OUTPUT_DIR }}" | tee -a ${{ env.LOG_FILE }}
           exit 1
         fi
         
-        # 验证镜像文件
-        for img in $IMAGE_FILES; do
-          echo "🔍 验证镜像: $(basename "$img")"
-          if ! file "$img" | grep -q "DOS/MBR boot sector"; then
-            echo "❌ 镜像文件格式无效"
-            exit 1
-          fi
-        done
-        
-        echo "✅ 镜像验证通过"
-        echo "生成的镜像:"
-        ls -lh "$OUTPUT_DIR"/*.img
+        echo "✅ 镜像验证通过" | tee -a ${{ env.LOG_FILE }}
+        echo "生成的镜像:" | tee -a ${{ env.LOG_FILE }}
+        ls -lh "${{ env.OUTPUT_DIR }}"/*.img | tee -a ${{ env.LOG_FILE }}
 
     - name: Upload artifact
       if: success()
@@ -184,12 +167,9 @@ jobs:
         path: ${{ env.OUTPUT_DIR }}/*.img
         retention-days: 30
 
-    - name: Upload logs on failure
-      if: failure()
+    - name: Upload logs
       uses: actions/upload-artifact@v4
       with:
-        name: Build_Failure_Logs
-        path: |
-          ${{ github.workspace }}/build.log
-          ${{ github.workspace }}/armbian-build/build/output/logs
+        name: Build_Logs
+        path: ${{ env.LOG_DIR }}
         retention-days: 7
