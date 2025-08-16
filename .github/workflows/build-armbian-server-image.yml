@@ -1,175 +1,48 @@
-name: Build Armbian for S905L3B
+name: Build Armbian for S905L3B (USB Boot)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 仅手动触发
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    env:
-      BOARD: "s905l3"
-      RELEASE: "bullseye"
-      KERNEL_VERSION: "6.1.147"
-      DTB_URL: "https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/meson-gxlx2-p295.dtb"
-      DTB_FILE: "meson-gxlx2-p295.dtb"
-      OUTPUT_DIR: "${{ github.workspace }}/armbian-build/output/images"
-      LOG_DIR: "${{ github.workspace }}/logs"  # 新增专用日志目录
-
     steps:
-    - name: Checkout code
+    - name: 检查代码
       uses: actions/checkout@v4
 
-    - name: Create log directory
+    - name: 克隆 Armbian 构建仓库
       run: |
-        # 创建专用日志目录并设置权限
-        sudo mkdir -p ${{ env.LOG_DIR }}
-        sudo chmod -R 777 ${{ env.LOG_DIR }}
-        echo "LOG_FILE=${{ env.LOG_DIR }}/build.log" >> $GITHUB_ENV
-
-    - name: Setup build environment
-      run: |
-        # 设置日志文件
-        echo "=== 环境设置开始 ===" | tee ${{ env.LOG_FILE }}
-        
-        # 添加必要的软件源
-        sudo add-apt-repository universe -y | tee -a ${{ env.LOG_FILE }}
-        sudo add-apt-repository multiverse -y | tee -a ${{ env.LOG_FILE }}
-        sudo apt update -y | tee -a ${{ env.LOG_FILE }}
-        
-        # 安装最小依赖集
-        sudo apt install -y \
-          git wget xz-utils \
-          device-tree-compiler 2>&1 | tee -a ${{ env.LOG_FILE }}
-        
-        # 验证基本工具
-        for cmd in git wget dtc; do
-          if ! command -v $cmd; then
-            echo "❌ $cmd 未安装成功" | tee -a ${{ env.LOG_FILE }}
-            exit 1
-          fi
-        done
-        
-        echo "✅ 环境设置完成" | tee -a ${{ env.LOG_FILE }}
-
-    - name: Prepare workspace
-      run: |
-        echo "=== 准备工作开始 ===" | tee -a ${{ env.LOG_FILE }}
-        
-        # 创建构建目录结构
-        mkdir -p armbian-build/userpatches/dtb
-        
-        # 下载DTB文件
-        wget -O "armbian-build/userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}" 2>&1 | tee -a ${{ env.LOG_FILE }}
-        
-        # 验证DTB文件
-        if ! file "armbian-build/userpatches/dtb/${{ env.DTB_FILE }}" | grep -q "Device Tree Blob"; then
-          echo "❌ DTB文件无效" | tee -a ${{ env.LOG_FILE }}
-          exit 1
-        fi
-        echo "✅ DTB文件验证通过" | tee -a ${{ env.LOG_FILE }}
-
-    - name: Clone Armbian build repository
-      run: |
-        echo "=== 克隆仓库开始 ===" | tee -a ${{ env.LOG_FILE }}
-        
-        cd armbian-build
-        git clone --depth=1 https://github.com/armbian/build.git 2>&1 | tee -a ${{ env.LOG_FILE }}
+        git clone --depth=1 https://github.com/armbian/build.git
         cd build
-        
-        # 验证仓库结构
+        # 验证关键脚本存在
         if [ ! -f compile.sh ]; then
-          echo "❌ 仓库克隆失败" | tee -a ${{ env.LOG_FILE }}
+          echo "Armbian 仓库克隆失败"
           exit 1
         fi
-        echo "✅ Armbian仓库克隆成功" | tee -a ${{ env.LOG_FILE }}
 
-    - name: Run minimal build test
+    - name: 安装依赖
       run: |
-        echo "=== 最小化构建测试开始 ===" | tee -a ${{ env.LOG_FILE }}
-        
-        cd armbian-build/build
-        
-        # 执行最小化构建测试
+        sudo apt update
+        sudo apt install -y build-essential git libncurses5-dev libssl-dev \
+          bc flex bison libelf-dev liblz4-tool whiptail parted kmod \
+          debootstrap qemu-user-static chroot dosfstools rsync u-boot-tools
+
+    - name: 编译 Armbian 镜像（S905L3 + U 盘启动）
+      run: |
+        cd build
         sudo ./compile.sh \
-          BOARD="${{ env.BOARD }}" \
-          BRANCH=current \
-          RELEASE="${{ env.RELEASE }}" \
-          KERNEL_ONLY=yes \
-          KERNEL_CONFIGURE=no \
-          BUILD_MINIMAL=yes \
-          CLEAN_LEVEL="none" \
-          USE_TORRENT=no \
-          CUSTOM_DTB="../../userpatches/dtb/${{ env.DTB_FILE }}" \
-          KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" 2>&1 | tee -a ${{ env.LOG_FILE }}
-        
-        # 检查退出状态
-        if [ $? -ne 0 ]; then
-          echo "❌ 最小化构建失败" | tee -a ${{ env.LOG_FILE }}
-          exit 1
-        fi
-        echo "✅ 最小化构建测试通过" | tee -a ${{ env.LOG_FILE }}
+          BOARD=s905l3 \          # 芯片型号（S905L3 通用标识）
+          BRANCH=current \        # 稳定分支
+          RELEASE=bullseye \      # Debian 11（轻量稳定）
+          KERNEL_ONLY=no \        # 编译完整镜像（含内核+根文件系统）
+          BUILD_DESKTOP=no \      # 无桌面（节省资源，U 盘启动优先）
+          CLEAN_LEVEL=images \    # 仅清理旧镜像（加速构建）
+          USE_TORRENT=no \        # 禁用种子下载（加速）
+          EXTRA_ARGUMENTS="USB_INIT=yes"  # 强制 U 盘启动初始化
 
-    - name: Full build
-      run: |
-        echo "=== 完整构建开始 ===" | tee -a ${{ env.LOG_FILE }}
-        
-        cd armbian-build/build
-        
-        # 执行完整构建
-        sudo ./compile.sh \
-          BOARD="${{ env.BOARD }}" \
-          BRANCH=current \
-          RELEASE="${{ env.RELEASE }}" \
-          KERNEL_ONLY=no \
-          KERNEL_CONFIGURE=no \
-          BUILD_DESKTOP=no \
-          CLEAN_LEVEL="none" \
-          USE_TORRENT=no \
-          CUSTOM_DTB="../../userpatches/dtb/${{ env.DTB_FILE }}" \
-          KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
-          EXTRA_ARGUMENTS="USB_INIT=yes" 2>&1 | tee -a ${{ env.LOG_FILE }}
-        
-        # 检查构建状态
-        if [ $? -ne 0 ]; then
-          echo "❌ 完整构建失败" | tee -a ${{ env.LOG_FILE }}
-          exit 1
-        fi
-        echo "✅ 完整构建成功" | tee -a ${{ env.LOG_FILE }}
-
-    - name: Verify output
-      run: |
-        echo "=== 验证输出开始 ===" | tee -a ${{ env.LOG_FILE }}
-        
-        # 检查输出目录
-        if [ ! -d "${{ env.OUTPUT_DIR }}" ]; then
-          echo "❌ 输出目录不存在: ${{ env.OUTPUT_DIR }}" | tee -a ${{ env.LOG_FILE }}
-          exit 1
-        fi
-        
-        # 检查镜像文件
-        IMAGE_FILES=$(ls "${{ env.OUTPUT_DIR }}"/*.img 2>/dev/null)
-        if [ -z "$IMAGE_FILES" ]; then
-          echo "❌ 未找到镜像文件" | tee -a ${{ env.LOG_FILE }}
-          echo "目录内容:" | tee -a ${{ env.LOG_FILE }}
-          ls -la "${{ env.OUTPUT_DIR }}" | tee -a ${{ env.LOG_FILE }}
-          exit 1
-        fi
-        
-        echo "✅ 镜像验证通过" | tee -a ${{ env.LOG_FILE }}
-        echo "生成的镜像:" | tee -a ${{ env.LOG_FILE }}
-        ls -lh "${{ env.OUTPUT_DIR }}"/*.img | tee -a ${{ env.LOG_FILE }}
-
-    - name: Upload artifact
-      if: success()
+    - name: 上传镜像
       uses: actions/upload-artifact@v4
       with:
-        name: Armbian_S905L3B_Image
-        path: ${{ env.OUTPUT_DIR }}/*.img
-        retention-days: 30
-
-    - name: Upload logs
-      uses: actions/upload-artifact@v4
-      with:
-        name: Build_Logs
-        path: ${{ env.LOG_DIR }}
-        retention-days: 7
+        name: armbian-s905l3b-usb
+        path: build/output/images/*.img.xz  # 压缩后的镜像（更小，便于下载）
+        retention-days: 30  # 镜像保留 30 天
