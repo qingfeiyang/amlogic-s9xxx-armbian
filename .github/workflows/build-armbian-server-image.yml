@@ -81,7 +81,7 @@ jobs:
         ls -lh ${{ env.OUTPUT_DIR }}/*.img.xz
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: Armbian_S905L3B_Image
         # Armbian默认生成xz压缩的镜像，需包含压缩文件
