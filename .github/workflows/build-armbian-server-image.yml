@@ -249,8 +249,10 @@ on:
           - angel
 
 env:
-  TZ: America/New_York
-  ROOTFS_SCRIPT: compile-kernel/tools/script/docker/build_armbian_rootfs_file.sh
+  BOARDS: "s905l3b"
+  RELEASE: "bullseye"
+  KERNEL: "6.1.147"
+  DTB_PATH: "meson-gxlx2-p295.dtb"
 
 jobs:
   build:
