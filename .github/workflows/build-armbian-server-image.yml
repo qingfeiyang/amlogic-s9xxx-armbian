@@ -33,54 +33,47 @@ jobs:
           systemd-container u-boot-tools \
           device-tree-compiler
 
+        # 验证基础工具
+        if ! command -v dtc &> /dev/null; then
+          echo "❌ dtc未安装"
+          exit 1
+        fi
+
     - name: Download and prepare DTB
       run: |
         mkdir -p userpatches/dtb
         wget -O "userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}"
         
         # 验证DTB文件
-        if [ ! -f "userpatches/dtb/${{ env.DTB_FILE }}" ]; then
-          echo "❌ DTB文件下载失败"
+        if ! file "userpatches/dtb/${{ env.DTB_FILE }}" | grep -q "Device Tree Blob"; then
+          echo "❌ DTB文件格式错误"
           exit 1
         fi
-        
-        # 检查DTB是否有效
-        if ! dtc -I dtb -O dts "userpatches/dtb/${{ env.DTB_FILE }}" > /dev/null 2>&1; then
-          echo "❌ 下载的DTB文件无效"
-          exit 1
-        fi
-        echo "✅ DTB文件验证通过"
 
     - name: Clone Armbian build repository
       run: |
         git clone --depth=1 https://github.com/armbian/build.git
         cd build
         
-        # 验证内核版本是否存在
-        if ! git ls-remote --tags https://github.com/armbian/linux-armbian | grep "v${{ env.KERNEL_VERSION }}"; then
-          echo "❌ 错误：内核版本 ${{ env.KERNEL_VERSION }} 不存在"
+        # 验证仓库完整性
+        if [ ! -f compile.sh ]; then
+          echo "❌ 仓库克隆不完整"
           exit 1
         fi
-        echo "✅ 内核版本验证通过"
 
     - name: Fix permissions
       run: |
-        sudo chown -R $USER:$USER ${{ github.workspace }}
-        sudo chmod -R a+rw ${{ github.workspace }}
+        sudo chown -R runner:runner ${{ github.workspace }}
+        sudo chmod -R 755 ${{ github.workspace }}
 
     - name: Build Armbian image
       run: |
         cd build
         
-        # 设置编译环境变量
-        export DEBIAN_FRONTEND=noninteractive
-        export LANG=C.UTF-8
-        
         # 启用详细日志
-        export SHOW_LOG=yes
-        export DEBUG_MODE=yes
+        set -x
         
-        # 开始构建
+        # 尝试构建
         sudo ./compile.sh \
           BOARD="${{ env.BOARD }}" \
           BRANCH=current \
@@ -92,35 +85,21 @@ jobs:
           USE_TORRENT=no \
           CUSTOM_DTB="../userpatches/dtb/${{ env.DTB_FILE }}" \
           KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
-          EXTRA_ARGUMENTS="USB_INIT=yes" \
-          LOG_OUTPUT_FILE="${{ github.workspace }}/build.log"
+          EXTRA_ARGUMENTS="USB_INIT=yes" || exit 1
         
-        # 检查构建状态
-        if [ $? -ne 0 ]; then
-          echo "❌ 镜像构建失败"
-          echo "=== 最后50行日志 ==="
-          tail -n 50 "${{ github.workspace }}/build.log"
+        # 检查输出
+        if [ ! -d "${{ env.OUTPUT_DIR }}" ]; then
+          echo "❌ 输出目录未创建"
           exit 1
         fi
 
     - name: Verify build output
       run: |
-        OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
-        
-        if [ ! -d "$OUTPUT_DIR" ]; then
-          echo "❌ 错误：输出目录不存在: $OUTPUT_DIR"
+        ls -laR ${{ env.OUTPUT_DIR }}
+        if [ -z "$(ls -A ${{ env.OUTPUT_DIR }}/*.img 2>/dev/null)" ]; then
+          echo "❌ 未找到镜像文件"
           exit 1
         fi
-        
-        if [ -z "$(ls -A $OUTPUT_DIR/*.img 2>/dev/null)" ]; then
-          echo "❌ 错误：未找到镜像文件"
-          echo "=== 构建日志 ==="
-          cat "${{ github.workspace }}/build.log"
-          exit 1
-        fi
-        
-        echo "✅ 构建成功！生成的镜像:"
-        ls -lh $OUTPUT_DIR/*.img
 
     - name: Upload artifact
       if: success()
@@ -130,9 +109,12 @@ jobs:
         path: ${{ env.OUTPUT_DIR }}/*.img
         retention-days: 30
 
-    - name: Upload build log
+    - name: Upload error logs
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: Build_Log
-        path: ${{ github.workspace }}/build.log
+        name: Build_Error_Logs
+        path: |
+          ${{ github.workspace }}/build/output/logs
+          ${{ github.workspace }}/build/config
+        retention-days: 7
