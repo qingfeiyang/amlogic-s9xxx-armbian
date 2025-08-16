@@ -1,4 +1,4 @@
-name: Build Armbian for S905L3B (Fixed Dependencies)
+name: Build Armbian for S905L3B (Force Logs)
 
 on:
   workflow_dispatch:
@@ -14,59 +14,39 @@ jobs:
       run: |
         git clone --depth=1 https://github.com/armbian/build.git
 
-    - name: 安装依赖（带详细日志）
+    - name: 安装依赖（强制日志输出，极简步骤）
       run: |
-        # 强制输出所有日志到文件，方便排查
-        exec > >(tee -i /tmp/deps-install.log) 2>&1
-        
-        echo "=== 清理系统缓存释放空间 ==="
-        sudo apt clean
-        sudo rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
-        df -h  # 查看磁盘空间
-        
-        echo "=== 更换国内 apt 源（解决网络问题） ==="
-        # 替换为阿里云 Ubuntu 22.04 源（避免官方源访问慢）
-        sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-        echo "deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse
-        deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse
-        deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse
-        deb http://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse" | sudo tee /etc/apt/sources.list
-        
-        echo "=== 更新源并安装依赖 ==="
-        # 分步执行，先更新源（单独检查是否失败）
-        if ! sudo apt update -y; then
-          echo "❌ apt 更新源失败"
-          exit 1
-        fi
-        
-        # 安装基础依赖（分批次安装，定位可能失败的包）
-        essential_pkgs="build-essential git libncurses5-dev libssl-dev"
-        if ! sudo apt install -y $essential_pkgs; then
-          echo "❌ 基础编译工具安装失败"
-          exit 1
-        fi
-        
-        kernel_pkgs="bc flex bison libelf-dev liblz4-tool"
-        if ! sudo apt install -y $kernel_pkgs; then
-          echo "❌ 内核编译依赖安装失败"
-          exit 1
-        fi
-        
-        system_pkgs="whiptail parted kmod debootstrap qemu-user-static chroot dosfstools rsync u-boot-tools"
-        if ! sudo apt install -y $system_pkgs; then
-          echo "❌ 系统工具依赖安装失败"
-          exit 1
-        fi
-        
-        echo "=== 依赖安装成功 ==="
+        # 关键：开启命令跟踪（每步命令都打印），并强制输出到 GitHub 日志流
+        set -x
+        # 确保日志能被 GitHub 捕获（即使中间失败）
+        echo "=== 系统状态检查 ==="
+        df -h  # 检查磁盘空间（exit code 1 常见原因：磁盘满）
+        free -m  # 检查内存
+        id  # 检查当前用户权限
 
-    - name: 上传依赖安装日志（无论成功与否）
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: deps-install-logs
-        path: /tmp/deps-install.log
-        retention-days: 7
+        echo "=== 清理系统缓存 ==="
+        sudo apt clean
+        sudo rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* || true  # 允许失败
+
+        echo "=== 更换为清华 apt 源（确保网络稳定） ==="
+        sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+        echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy main restricted universe multiverse
+        deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-updates main restricted universe multiverse
+        deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-backports main restricted universe multiverse
+        deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy-security main restricted universe multiverse" | sudo tee /etc/apt/sources.list
+
+        echo "=== 更新源（单独步骤，失败立即报错） ==="
+        sudo apt update -y || { echo "❌ apt update 失败"; exit 1; }
+
+        echo "=== 安装核心依赖（分最小集，逐个检查） ==="
+        # 只安装必须依赖，减少失败点
+        sudo apt install -y build-essential || { echo "❌ 缺少基础编译工具"; exit 1; }
+        sudo apt install -y git wget || { echo "❌ 缺少 git/wget"; exit 1; }
+        sudo apt install -y debootstrap qemu-user-static || { echo "❌ 缺少系统构建工具"; exit 1; }
+        sudo apt install -y linux-headers-generic || { echo "❌ 缺少内核头文件（非致命，继续）"; }
+
+        echo "=== 依赖安装成功 ==="
+        set +x  # 关闭命令跟踪
 
     - name: 编译 Armbian 镜像
       run: |
