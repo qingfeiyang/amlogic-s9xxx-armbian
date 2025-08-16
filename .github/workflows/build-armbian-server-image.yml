@@ -7,14 +7,15 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     env:
-      # 注意：Armbian官方仓库中S905L3系列通常使用"s905l3"作为BOARD名称
+      # 修正：使用官方支持的BOARD名称
       BOARD: "s905l3"
       RELEASE: "bullseye"
       KERNEL_VERSION: "6.1.147"
-      # 设备树使用与你的gxlx2_p295_1g匹配的版本
-      DTB_PATH: "https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/gxlx2_p295_1g.dtb"
-      # 输出镜像目录
-      OUTPUT_DIR: "build/output/images"
+      # 修正：使用正确的DTB文件名和路径
+      DTB_URL: "https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/meson-gxlx2-p295.dtb"
+      DTB_FILE: "meson-gxlx2-p295.dtb"
+      # 修正：使用绝对路径确保一致性
+      OUTPUT_DIR: "${{ github.workspace }}/build/output/images"
 
     steps:
     - name: Checkout code
@@ -22,69 +23,99 @@ jobs:
 
     - name: Setup build environment
       run: |
-        # 安装必要依赖（Armbian推荐的完整依赖列表）
         sudo apt update -y
         sudo apt install -y \
           build-essential git libncurses5-dev libssl-dev \
           bc flex bison libelf-dev liblz4-tool whiptail \
           parted kmod debootstrap qemu-user-static \
-          chroot dosfstools rsync u-boot-tools curl
+          chroot dosfstools rsync u-boot-tools curl \
+          wget xz-utils cpio
+        
+        # 添加docker组权限
+        sudo usermod -aG docker $USER
+        newgrp docker
 
     - name: Download and prepare DTB
       run: |
-        # 下载设备树并放在userpatches目录（Armbian优先读取此目录的DTB）
-        mkdir -p userpatches/dtb
-        wget -O "userpatches/dtb/gxlx2_p295_1g.dtb" ${{ env.DTB_PATH }}
-        # 验证DTB文件是否下载成功
-        if [ ! -f "userpatches/dtb/gxlx2_p295_1g.dtb" ]; then
-          echo "DTB文件下载失败"
+        # 创建必要的目录结构
+        mkdir -p ${{ github.workspace }}/userpatches/dtb
+        
+        # 下载正确的DTB文件
+        wget -O "${{ github.workspace }}/userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}"
+        
+        # 验证DTB文件
+        if [ ! -f "${{ github.workspace }}/userpatches/dtb/${{ env.DTB_FILE }}" ]; then
+          echo "❌ DTB文件下载失败"
           exit 1
         fi
+        echo "✅ DTB文件准备就绪"
 
     - name: Clone Armbian build repository
       run: |
         git clone --depth=1 https://github.com/armbian/build.git
         cd build
-        # 检查内核标签是否存在
-        if ! git ls-remote --tags https://github.com/armbian/linux | grep -q "v${{ env.KERNEL_VERSION }}"; then
-          echo "内核版本 ${KERNEL_VERSION} 不存在，请检查版本号"
+        
+        # 修正：使用正确的内核仓库检查
+        if ! git ls-remote --tags https://github.com/armbian/linux-armbian | grep -q "v${{ env.KERNEL_VERSION }}"; then
+          echo "❌ 内核版本 ${{ env.KERNEL_VERSION }} 不存在"
           exit 1
         fi
+        echo "✅ 内核版本验证通过"
 
     - name: Build Armbian image
       run: |
         cd build
+        
+        # 修正：添加必要的环境变量
+        export DEBIAN_FRONTEND=noninteractive
+        export LANG=C.UTF-8
+        
+        # 修正：使用正确的构建命令
         sudo ./compile.sh \
-          BOARD=${{ env.BOARD }} \
+          BOARD="${{ env.BOARD }}" \
           BRANCH=current \
-          RELEASE=${{ env.RELEASE }} \
+          RELEASE="${{ env.RELEASE }}" \
           KERNEL_ONLY=no \
           KERNEL_CONFIGURE=no \
           BUILD_DESKTOP=no \
-          # 清理级别设为images，避免重复编译工具链（加速构建）
           CLEAN_LEVEL="images" \
           USE_TORRENT=no \
-          # 指定自定义DTB（相对于build目录的路径）
-          CUSTOM_DTB="../userpatches/dtb/gxlx2_p295_1g.dtb" \
+          # 修正：使用正确的DTB路径（相对build目录）
+          CUSTOM_DTB="../../userpatches/dtb/${{ env.DTB_FILE }}" \
           KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
-          # 增加U盘启动支持的参数
-          EXTRA_ARGUMENTS="USB_INIT=yes"
+          # 修正：使用环境变量传递参数
+          EXTRA_ARMBIAN_ENVIRONMENT="USB_INIT=yes"
+        
+        # 检查构建状态
+        if [ $? -ne 0 ]; then
+          echo "❌ 镜像构建失败"
+          exit 1
+        fi
 
     - name: Verify build output
       run: |
-        # 检查是否生成了镜像文件
-        if [ -z "$(ls -A ${{ env.OUTPUT_DIR }}/*.img.xz 2>/dev/null)" ]; then
-          echo "构建失败，未生成镜像文件"
+        # 修正：使用正确的输出路径
+        OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+        
+        if [ ! -d "$OUTPUT_DIR" ]; then
+          echo "❌ 输出目录不存在: $OUTPUT_DIR"
           exit 1
         fi
-        # 显示生成的镜像名称
-        ls -lh ${{ env.OUTPUT_DIR }}/*.img.xz
+        
+        # 检查镜像文件
+        if [ -z "$(ls -A $OUTPUT_DIR/*.img 2>/dev/null)" ]; then
+          echo "❌ 未找到镜像文件"
+          exit 1
+        fi
+        
+        # 显示构建结果
+        echo "✅ 构建成功！生成的镜像:"
+        ls -lh $OUTPUT_DIR/*.img
+        du -h $OUTPUT_DIR/*.img
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: Armbian_S905L3B_Image
-        # Armbian默认生成xz压缩的镜像，需包含压缩文件
-        path: ${{ env.OUTPUT_DIR }}/*.img.xz
-        # 保留镜像30天
+        path: ${{ env.OUTPUT_DIR }}/*.img
         retention-days: 30
