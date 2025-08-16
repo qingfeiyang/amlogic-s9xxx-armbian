@@ -1,7 +1,7 @@
-name: Build Armbian for S905L3B (USB Boot)
+name: Build Armbian for S905L3B (Fixed Dependencies)
 
 on:
-  workflow_dispatch:  # 仅手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -10,39 +10,80 @@ jobs:
     - name: 检查代码
       uses: actions/checkout@v4
 
-    - name: 克隆 Armbian 构建仓库
+    - name: 克隆 Armbian 仓库
       run: |
         git clone --depth=1 https://github.com/armbian/build.git
-        cd build
-        # 验证关键脚本存在
-        if [ ! -f compile.sh ]; then
-          echo "Armbian 仓库克隆失败"
+
+    - name: 安装依赖（带详细日志）
+      run: |
+        # 强制输出所有日志到文件，方便排查
+        exec > >(tee -i /tmp/deps-install.log) 2>&1
+        
+        echo "=== 清理系统缓存释放空间 ==="
+        sudo apt clean
+        sudo rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
+        df -h  # 查看磁盘空间
+        
+        echo "=== 更换国内 apt 源（解决网络问题） ==="
+        # 替换为阿里云 Ubuntu 22.04 源（避免官方源访问慢）
+        sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+        echo "deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse
+        deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse
+        deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse
+        deb http://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse" | sudo tee /etc/apt/sources.list
+        
+        echo "=== 更新源并安装依赖 ==="
+        # 分步执行，先更新源（单独检查是否失败）
+        if ! sudo apt update -y; then
+          echo "❌ apt 更新源失败"
           exit 1
         fi
+        
+        # 安装基础依赖（分批次安装，定位可能失败的包）
+        essential_pkgs="build-essential git libncurses5-dev libssl-dev"
+        if ! sudo apt install -y $essential_pkgs; then
+          echo "❌ 基础编译工具安装失败"
+          exit 1
+        fi
+        
+        kernel_pkgs="bc flex bison libelf-dev liblz4-tool"
+        if ! sudo apt install -y $kernel_pkgs; then
+          echo "❌ 内核编译依赖安装失败"
+          exit 1
+        fi
+        
+        system_pkgs="whiptail parted kmod debootstrap qemu-user-static chroot dosfstools rsync u-boot-tools"
+        if ! sudo apt install -y $system_pkgs; then
+          echo "❌ 系统工具依赖安装失败"
+          exit 1
+        fi
+        
+        echo "=== 依赖安装成功 ==="
 
-    - name: 安装依赖
-      run: |
-        sudo apt update
-        sudo apt install -y build-essential git libncurses5-dev libssl-dev \
-          bc flex bison libelf-dev liblz4-tool whiptail parted kmod \
-          debootstrap qemu-user-static chroot dosfstools rsync u-boot-tools
+    - name: 上传依赖安装日志（无论成功与否）
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: deps-install-logs
+        path: /tmp/deps-install.log
+        retention-days: 7
 
-    - name: 编译 Armbian 镜像（S905L3 + U 盘启动）
+    - name: 编译 Armbian 镜像
       run: |
         cd build
         sudo ./compile.sh \
-          BOARD=s905l3 \          # 芯片型号（S905L3 通用标识）
-          BRANCH=current \        # 稳定分支
-          RELEASE=bullseye \      # Debian 11（轻量稳定）
-          KERNEL_ONLY=no \        # 编译完整镜像（含内核+根文件系统）
-          BUILD_DESKTOP=no \      # 无桌面（节省资源，U 盘启动优先）
-          CLEAN_LEVEL=images \    # 仅清理旧镜像（加速构建）
-          USE_TORRENT=no \        # 禁用种子下载（加速）
-          EXTRA_ARGUMENTS="USB_INIT=yes"  # 强制 U 盘启动初始化
+          BOARD=s905l3 \
+          BRANCH=current \
+          RELEASE=bullseye \
+          KERNEL_ONLY=no \
+          BUILD_DESKTOP=no \
+          CLEAN_LEVEL=images \
+          USE_TORRENT=no \
+          EXTRA_ARGUMENTS="USB_INIT=yes"
 
     - name: 上传镜像
       uses: actions/upload-artifact@v4
       with:
         name: armbian-s905l3b-usb
-        path: build/output/images/*.img.xz  # 压缩后的镜像（更小，便于下载）
-        retention-days: 30  # 镜像保留 30 天
+        path: build/output/images/*.img.xz
+        retention-days: 30
