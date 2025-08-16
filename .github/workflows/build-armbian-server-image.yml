@@ -12,7 +12,7 @@ jobs:
       KERNEL_VERSION: "6.1.147"
       DTB_URL: "https://raw.githubusercontent.com/ophub/amlogic-dtb/meson-gxl/meson-gxlx2-p295.dtb"
       DTB_FILE: "meson-gxlx2-p295.dtb"
-      OUTPUT_DIR: "${{ github.workspace }}/build/output/images"
+      OUTPUT_DIR: "${{ github.workspace }}/armbian-build/output/images"
 
     steps:
     - name: Checkout code
@@ -20,60 +20,94 @@ jobs:
 
     - name: Setup build environment
       run: |
+        # 添加必要的软件源
+        sudo add-apt-repository universe -y
+        sudo add-apt-repository multiverse -y
         sudo apt update -y
+        
+        # 安装完整的依赖包
         sudo apt install -y \
           build-essential git libncurses5-dev libssl-dev \
           bc flex bison libelf-dev liblz4-tool whiptail \
           parted kmod debootstrap qemu-user-static \
-          chroot dosfstools rsync u-boot-tools curl \
+          dosfstools rsync u-boot-tools curl \
           wget xz-utils cpio \
           python3-dev python3-pip python3-setuptools \
           libpython3-dev libffi-dev libssl-dev \
           binfmt-support qemu-user-static \
           systemd-container u-boot-tools \
-          device-tree-compiler
+          device-tree-compiler \
+          coreutils debootstrap systemd \
+          docker.io docker-compose
+        
+        # 验证关键工具
+        for cmd in chroot debootstrap dtc; do
+          if ! command -v $cmd; then
+            echo "❌ $cmd 未安装成功"
+            exit 1
+          fi
+        done
 
-        # 验证基础工具
-        if ! command -v dtc &> /dev/null; then
-          echo "❌ dtc未安装"
-          exit 1
-        fi
-
-    - name: Download and prepare DTB
+    - name: Prepare workspace
       run: |
-        mkdir -p userpatches/dtb
-        wget -O "userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}"
+        # 创建干净的构建目录结构
+        mkdir -p armbian-build/userpatches/dtb
+        
+        # 下载DTB文件
+        wget -O "armbian-build/userpatches/dtb/${{ env.DTB_FILE }}" "${{ env.DTB_URL }}"
         
         # 验证DTB文件
-        if ! file "userpatches/dtb/${{ env.DTB_FILE }}" | grep -q "Device Tree Blob"; then
-          echo "❌ DTB文件格式错误"
+        if ! file "armbian-build/userpatches/dtb/${{ env.DTB_FILE }}" | grep -q "Device Tree Blob"; then
+          echo "❌ DTB文件无效"
           exit 1
         fi
+        echo "✅ DTB文件验证通过"
 
     - name: Clone Armbian build repository
       run: |
+        cd armbian-build
         git clone --depth=1 https://github.com/armbian/build.git
         cd build
         
-        # 验证仓库完整性
+        # 验证仓库结构
         if [ ! -f compile.sh ]; then
-          echo "❌ 仓库克隆不完整"
+          echo "❌ 仓库克隆失败"
           exit 1
         fi
+        echo "✅ Armbian仓库克隆成功"
 
-    - name: Fix permissions
+    - name: Run minimal build test
       run: |
-        sudo chown -R runner:runner ${{ github.workspace }}
-        sudo chmod -R 755 ${{ github.workspace }}
+        cd armbian-build/build
+        
+        # 执行最小化构建测试
+        sudo ./compile.sh \
+          BOARD="${{ env.BOARD }}" \
+          BRANCH=current \
+          RELEASE="${{ env.RELEASE }}" \
+          KERNEL_ONLY=yes \
+          KERNEL_CONFIGURE=no \
+          BUILD_MINIMAL=yes \
+          CLEAN_LEVEL="none" \
+          USE_TORRENT=no \
+          CUSTOM_DTB="../../userpatches/dtb/${{ env.DTB_FILE }}" \
+          KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
+          LOG_OUTPUT_FILE="$GITHUB_WORKSPACE/build.log"
+        
+        # 检查退出状态
+        if [ $? -ne 0 ]; then
+          echo "❌ 最小化构建失败"
+          echo "=== 构建日志最后50行 ==="
+          tail -n 50 "$GITHUB_WORKSPACE/build.log" || echo "无日志文件"
+          exit 1
+        fi
+        echo "✅ 最小化构建测试通过"
 
-    - name: Build Armbian image
+    - name: Full build
       run: |
-        cd build
+        cd armbian-build/build
         
-        # 启用详细日志
-        set -x
-        
-        # 尝试构建
+        # 执行完整构建
         sudo ./compile.sh \
           BOARD="${{ env.BOARD }}" \
           BRANCH=current \
@@ -83,23 +117,51 @@ jobs:
           BUILD_DESKTOP=no \
           CLEAN_LEVEL="none" \
           USE_TORRENT=no \
-          CUSTOM_DTB="../userpatches/dtb/${{ env.DTB_FILE }}" \
+          CUSTOM_DTB="../../userpatches/dtb/${{ env.DTB_FILE }}" \
           KERNELBRANCH="tag:v${{ env.KERNEL_VERSION }}" \
-          EXTRA_ARGUMENTS="USB_INIT=yes" || exit 1
+          EXTRA_ARGUMENTS="USB_INIT=yes" \
+          LOG_OUTPUT_FILE="$GITHUB_WORKSPACE/build.log"
         
-        # 检查输出
-        if [ ! -d "${{ env.OUTPUT_DIR }}" ]; then
-          echo "❌ 输出目录未创建"
+        # 检查构建状态
+        if [ $? -ne 0 ]; then
+          echo "❌ 完整构建失败"
+          echo "=== 构建日志最后50行 ==="
+          tail -n 50 "$GITHUB_WORKSPACE/build.log"
           exit 1
         fi
+        echo "✅ 完整构建成功"
 
-    - name: Verify build output
+    - name: Verify output
       run: |
-        ls -laR ${{ env.OUTPUT_DIR }}
-        if [ -z "$(ls -A ${{ env.OUTPUT_DIR }}/*.img 2>/dev/null)" ]; then
-          echo "❌ 未找到镜像文件"
+        OUTPUT_DIR="${{ env.OUTPUT_DIR }}"
+        
+        # 检查输出目录
+        if [ ! -d "$OUTPUT_DIR" ]; then
+          echo "❌ 输出目录不存在: $OUTPUT_DIR"
           exit 1
         fi
+        
+        # 检查镜像文件
+        IMAGE_FILES=$(ls "$OUTPUT_DIR"/*.img 2>/dev/null)
+        if [ -z "$IMAGE_FILES" ]; then
+          echo "❌ 未找到镜像文件"
+          echo "目录内容:"
+          ls -la "$OUTPUT_DIR"
+          exit 1
+        fi
+        
+        # 验证镜像文件
+        for img in $IMAGE_FILES; do
+          echo "🔍 验证镜像: $(basename "$img")"
+          if ! file "$img" | grep -q "DOS/MBR boot sector"; then
+            echo "❌ 镜像文件格式无效"
+            exit 1
+          fi
+        done
+        
+        echo "✅ 镜像验证通过"
+        echo "生成的镜像:"
+        ls -lh "$OUTPUT_DIR"/*.img
 
     - name: Upload artifact
       if: success()
@@ -109,12 +171,12 @@ jobs:
         path: ${{ env.OUTPUT_DIR }}/*.img
         retention-days: 30
 
-    - name: Upload error logs
+    - name: Upload logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: Build_Error_Logs
+        name: Build_Failure_Logs
         path: |
-          ${{ github.workspace }}/build/output/logs
-          ${{ github.workspace }}/build/config
+          ${{ github.workspace }}/build.log
+          ${{ github.workspace }}/armbian-build/build/output/logs
         retention-days: 7
