@@ -1,125 +1,223 @@
-name: Build Armbian for S905L3B (Ultimate Fix)
+#==========================================================================
+# Description: Build Armbian for S905L3B (B860AV2.1-T) - USB Boot
+# Copyright (C) 2021 https://github.com/ophub/amlogic-s9xxx-armbian
+#==========================================================================
+
+name: Build Armbian for S905L3B (USB Boot)
 
 on:
+  repository_dispatch:
   workflow_dispatch:
+    inputs:
+      set_release:
+        description: "Select OS Release."
+        required: false
+        default: "bullseye"  # 轻量稳定，适合1G内存设备
+        type: choice
+        options:
+          - trixie
+          - bookworm
+          - bullseye
+          - noble
+          - jammy
+      armbian_board:
+        description: "Select device board (S905L3B for B860AV2.1-T)."
+        required: false
+        default: "s905l3b"  # 强制默认设备为S905L3B
+        type: choice
+        options:
+          - s905l3b  # 重点保留目标设备
+          - s905l3b-e900v21d
+          - s905l3b-e900v22d
+          - s905l3b-unt403a
+          - all  # 保留全量选项（可选）
+      armbian_kernel:
+        description: "Select kernel version (stable for S905L3B)."
+        required: false
+        default: "5.15.y_6.1.y"  # 5.15/6.1对S905L3B兼容性最佳
+        type: choice
+        options:
+          - 5.15.y
+          - 6.1.y
+          - 5.15.y_6.1.y
+      auto_kernel:
+        description: "Auto use the latest kernel."
+        required: false
+        default: true
+        type: boolean
+      kernel_repo:
+        description: "Set the kernel repository."
+        required: false
+        default: "ophub/kernel"
+        type: choice
+        options:
+          - ophub/kernel
+      kernel_usage:
+        description: "Set the tags of the stable kernel."
+        required: false
+        default: "stable"  # 稳定版内核减少兼容性问题
+        type: choice
+        options:
+          - stable
+          - flippy
+          - dev
+          - beta
+      armbian_fstype:
+        description: "Select armbian rootfs type (ext4 for USB)."
+        required: false
+        default: "ext4"  # U盘启动优先ext4格式
+        type: choice
+        options:
+          - ext4
+          - btrfs
+      armbian_storage:
+        description: "Select image storage type."
+        required: false
+        default: "save"
+        type: choice
+        options:
+          - save
+          - temp
+      builder_name:
+        description: "Set Armbian builder signature."
+        required: false
+        default: "ophub"
+        type: choice
+        options:
+          - ophub
+          - angel
+
+env:
+  TZ: America/New_York
+  ROOTFS_SCRIPT: compile-kernel/tools/script/docker/build_armbian_rootfs_file.sh
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    if: ${{ github.event.repository.owner.id }} == ${{ github.event.sender.id }}
+
     steps:
-    - name: 检查代码
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: 释放最大空间（关键步骤）
-      run: |
-        # 清理超大型无用软件，释放50GB+空间
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache /var/lib/docker
-        # 验证剩余空间（至少保留20GB以上）
-        df -h
-        # 增加交换分区（解决内存不足）
-        sudo fallocate -l 8G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
-        free -m  # 确认交换分区生效
+      - name: Initialization environment (Optimize for S905L3B)
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # 清理大文件释放空间（解决编译空间不足）
+          docker rmi $(docker images -q) 2>/dev/null
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          # 安装必要依赖
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install $(curl -fsSL https://tinyurl.com/ubuntu2204-build-armbian)
+          sudo -E systemctl daemon-reload
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo timedatectl set-timezone "${TZ}"
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
-    - name: 安装依赖（仅核心组件）
-      run: |
-        set -x  # 开启详细输出
-        sudo apt update -y
-        sudo apt install -y build-essential git debootstrap qemu-user-static \
-          bc flex bison libssl-dev u-boot-tools rsync device-tree-compiler
-        set +x
+      - name: Create simulated physical disk (Expand space)
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner.runner /builder
+          df -Th
 
-    - name: 编译Armbian（三重日志备份+资源限制）
-      run: |
-        # 1. 定义日志文件（同时输出到3个位置确保不丢失）
-        LOG_FILE1="/tmp/compile.log"
-        LOG_FILE2="${GITHUB_WORKSPACE}/compile.log"  # 工作目录日志（易保存）
-        LOG_FILE3="/dev/console"  # 系统控制台日志（内核级）
-        touch $LOG_FILE1 $LOG_FILE2
-        
-        # 2. 启动资源监控（每10秒记录一次，更密集监控）
-        (while true; do
-          echo "=== 资源监控 $(date) ===" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
-          free -m | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
-          df -h | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
-          top -b -n 1 | head -20 | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3  # 记录进程占用
-          sleep 10
-        done) &
-        MONITOR_PID=$!
+      - name: Download source code
+        id: down
+        working-directory: /builder
+        if: ${{ steps.init.outputs.status }} == 'success' && !cancelled()
+        run: |
+          df -hT ${PWD}
+          git clone -q --single-branch --depth=1 --branch=main https://github.com/armbian/build.git build
+          ln -sf /builder/build ${GITHUB_WORKSPACE}/build
+          ln -sf /builder/build /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian/main/build
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
-        # 3. 执行编译（限制CPU核心数为2，避免内存爆炸）
-        echo "=== 开始编译 $(date) ===" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
-        cd build
-        
-        # 关键：使用nohup确保进程不会突然退出
-        nohup sudo ./compile.sh \
-          BOARD=s905l3 \
-          BRANCH=legacy \
-          RELEASE=bullseye \
-          KERNEL_ONLY=no \
-          BUILD_DESKTOP=no \
-          CLEAN_LEVEL=images \
-          USE_TORRENT=no \
-          KERNELBRANCH="tag:v5.15.137" \
-          EXTRA_ARGUMENTS="USB_INIT=yes" \
-          --debug \
-          --jobs 2 > $LOG_FILE1 2>&1 &
-        
-        COMPILE_PID=$!
-        
-        # 4. 实时监控编译进程
-        while ps -p $COMPILE_PID > /dev/null; do
-          echo "编译进程仍在运行 (PID $COMPILE_PID)" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
-          sleep 30
-        done
-        
-        # 5. 获取最终退出状态
-        wait $COMPILE_PID
-        EXIT_CODE=$?
-        echo "=== 编译结束 $(date) 退出代码: $EXIT_CODE ===" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
-        
-        # 6. 清理监控进程
-        kill $MONITOR_PID
-        
-        # 7. 确保日志写入磁盘
-        sync
-        exit $EXIT_CODE
+      - name: Compile Armbian for S905L3B [ ${{ inputs.set_release }} ]
+        id: compile
+        working-directory: /builder
+        if: ${{ steps.down.outputs.status }} == 'success' && !cancelled()
+        run: |
+          cd build/
+          # 核心参数：适配S905L3B + U盘启动
+          ./compile.sh \
+            RELEASE=${{ inputs.set_release }} \
+            BOARD=s905l3b \  # 强制指定S905L3B芯片
+            BRANCH=current \
+            BUILD_MINIMAL=no \
+            BUILD_ONLY=default \
+            HOST=armbian \
+            BUILD_DESKTOP=no \  # 无桌面，适合U盘启动
+            EXPERT=yes \
+            KERNEL_CONFIGURE=no \
+            COMPRESS_OUTPUTIMAGE="sha" \
+            SHARE_LOG=yes \
+            EXTRA_ARGUMENTS="USB_INIT=yes"  # U盘启动初始化
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
-    - name: 强制上传所有日志（无论任何情况）
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: all-logs
-        path: |
-          /tmp/compile.log
-          ${{ github.workspace }}/compile.log
-        retention-days: 14  # 保留14天便于排查
+      - name: Organize files and clear space
+        id: clean
+        if: ${{ steps.compile.outputs.status }} == 'success' && !cancelled()
+        run: |
+          chmod +x ${ROOTFS_SCRIPT}
+          ${ROOTFS_SCRIPT} -v ${{ inputs.set_release }} -s true -c true -k true
+          df -hT ${PWD}
+          echo "build_tag=Armbian_S905L3B_${{ inputs.set_release }}_$(date +"%Y.%m")" >> ${GITHUB_OUTPUT}
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
-    - name: 上传系统日志（内核级）
-      if: always()
-      run: |
-        # 捕获dmesg日志（内核消息）
-        dmesg > dmesg.log
-        # 捕获系统日志
-        journalctl -b > journal.log
-      continue-on-error: true  # 即使失败也继续
+      - name: Upload Armbian image to Release
+        uses: ncipollo/release-action@main
+        if: ${{ steps.clean.outputs.status }} == 'success' && !cancelled()
+        with:
+          tag: ${{ steps.clean.outputs.build_tag }}
+          artifacts: build/output/images/*
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 上传内核日志
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-logs
-        path: |
-          dmesg.log
-          journal.log
-        retention-days: 14
+      - name: Rebuild Armbian (Optimize for USB boot)
+        uses: ophub/amlogic-s9xxx-armbian@main
+        if: ${{ steps.clean.outputs.status }} == 'success' && !cancelled()
+        with:
+          build_target: armbian
+          armbian_path: build/output/images/*.img.gz
+          armbian_board: ${{ inputs.armbian_board }}  # 使用S905L3B
+          armbian_kernel: ${{ inputs.armbian_kernel }}
+          auto_kernel: ${{ inputs.auto_kernel }}
+          kernel_repo: ${{ inputs.kernel_repo }}
+          kernel_usage: ${{ inputs.kernel_usage }}
+          armbian_fstype: ${{ inputs.armbian_fstype }}  # ext4适合U盘
+          builder_name: ${{ inputs.builder_name }}
 
-    - name: 上传镜像（成功时）
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: armbian-s905l3b-usb
-        path: build/output/images/*.img.xz
-        retention-days: 30
+      - name: Upload Rebuild image to Release
+        uses: ncipollo/release-action@main
+        if: ${{ env.PACKAGED_STATUS }} == 'success' && !cancelled()
+        with:
+          tag: ${{ steps.clean.outputs.build_tag }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### Armbian for B860AV2.1-T (S905L3B) - USB Boot
+            - Default username: root
+            - Default password: 1234
+            - U盘启动：写入后短接盒子启动
+            - 安装命令：armbian-install
+            - 更新命令：armbian-update
+            - 内核版本：${{ inputs.armbian_kernel }}
