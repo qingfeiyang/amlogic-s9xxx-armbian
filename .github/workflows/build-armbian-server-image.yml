@@ -25,7 +25,7 @@ jobs:
 
     - name: 安装依赖（仅核心组件）
       run: |
-        set -x
+        set -x  # 开启详细输出
         sudo apt update -y
         sudo apt install -y build-essential git debootstrap qemu-user-static \
           bc flex bison libssl-dev u-boot-tools rsync device-tree-compiler
@@ -36,23 +36,25 @@ jobs:
         # 1. 定义日志文件（同时输出到3个位置确保不丢失）
         LOG_FILE1="/tmp/compile.log"
         LOG_FILE2="${GITHUB_WORKSPACE}/compile.log"  # 工作目录日志（易保存）
+        LOG_FILE3="/dev/console"  # 系统控制台日志（内核级）
         touch $LOG_FILE1 $LOG_FILE2
-
+        
         # 2. 启动资源监控（每10秒记录一次，更密集监控）
         (while true; do
-          echo "=== 资源监控 $(date) ===" | tee -a $LOG_FILE1 $LOG_FILE2
-          free -m | tee -a $LOG_FILE1 $LOG_FILE2
-          df -h | tee -a $LOG_FILE1 $LOG_FILE2
-          top -b -n 1 | head -20 | tee -a $LOG_FILE1 $LOG_FILE2  # 记录进程占用
+          echo "=== 资源监控 $(date) ===" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
+          free -m | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
+          df -h | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
+          top -b -n 1 | head -20 | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3  # 记录进程占用
           sleep 10
         done) &
         MONITOR_PID=$!
 
         # 3. 执行编译（限制CPU核心数为2，避免内存爆炸）
-        echo "=== 开始编译 $(date) ===" | tee -a $LOG_FILE1 $LOG_FILE2
+        echo "=== 开始编译 $(date) ===" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
         cd build
-        # 关键：--jobs 2 限制并行任务，--debug 强制调试输出
-        sudo ./compile.sh \
+        
+        # 关键：使用nohup确保进程不会突然退出
+        nohup sudo ./compile.sh \
           BOARD=s905l3 \
           BRANCH=legacy \
           RELEASE=bullseye \
@@ -63,11 +65,27 @@ jobs:
           KERNELBRANCH="tag:v5.15.137" \
           EXTRA_ARGUMENTS="USB_INIT=yes" \
           --debug \
-          --jobs 2 2>&1 | tee -a $LOG_FILE1 $LOG_FILE2  # 同时输出到终端和日志
-
-        # 4. 清理监控进程
+          --jobs 2 > $LOG_FILE1 2>&1 &
+        
+        COMPILE_PID=$!
+        
+        # 4. 实时监控编译进程
+        while ps -p $COMPILE_PID > /dev/null; do
+          echo "编译进程仍在运行 (PID $COMPILE_PID)" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
+          sleep 30
+        done
+        
+        # 5. 获取最终退出状态
+        wait $COMPILE_PID
+        EXIT_CODE=$?
+        echo "=== 编译结束 $(date) 退出代码: $EXIT_CODE ===" | tee -a $LOG_FILE1 $LOG_FILE2 $LOG_FILE3
+        
+        # 6. 清理监控进程
         kill $MONITOR_PID
-        echo "=== 编译结束 $(date) ===" | tee -a $LOG_FILE1 $LOG_FILE2
+        
+        # 7. 确保日志写入磁盘
+        sync
+        exit $EXIT_CODE
 
     - name: 强制上传所有日志（无论任何情况）
       if: always()
@@ -78,6 +96,25 @@ jobs:
           /tmp/compile.log
           ${{ github.workspace }}/compile.log
         retention-days: 14  # 保留14天便于排查
+
+    - name: 上传系统日志（内核级）
+      if: always()
+      run: |
+        # 捕获dmesg日志（内核消息）
+        dmesg > dmesg.log
+        # 捕获系统日志
+        journalctl -b > journal.log
+      continue-on-error: true  # 即使失败也继续
+
+    - name: 上传内核日志
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-logs
+        path: |
+          dmesg.log
+          journal.log
+        retention-days: 14
 
     - name: 上传镜像（成功时）
       if: success()
